@@ -62,7 +62,7 @@ export class Tab {
     return this._isVisible;
   }
 
-  get webContents() {
+  get webContents(): Electron.WebContents {
     return this.webContentsView.webContents;
   }
 

@@ -1,5 +1,12 @@
 import { WebContents } from "electron";
-import { streamText, type LanguageModel, type CoreMessage } from "ai";
+import {
+  streamText,
+  stepCountIs,
+  type LanguageModel,
+  type ModelMessage,
+  type TextStreamPart,
+  type ToolSet,
+} from "ai";
 import { openai } from "@ai-sdk/openai";
 import { anthropic } from "@ai-sdk/anthropic";
 import * as dotenv from "dotenv";
@@ -35,7 +42,7 @@ export class LLMClient {
   private readonly provider: LLMProvider;
   private readonly modelName: string;
   private readonly model: LanguageModel | null;
-  private messages: CoreMessage[] = [];
+  private messages: ModelMessage[] = [];
 
   constructor(webContents: WebContents) {
     this.webContents = webContents;
@@ -89,14 +96,14 @@ export class LLMClient {
   private logInitializationStatus(): void {
     if (this.model) {
       console.log(
-        `✅ LLM Client initialized with ${this.provider} provider using model: ${this.modelName}`
+        `✅ LLM Client initialized with ${this.provider} provider using model: ${this.modelName}`,
       );
     } else {
       const keyName =
         this.provider === "anthropic" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY";
       console.error(
         `❌ LLM Client initialization failed: ${keyName} not found in environment variables.\n` +
-          `Please add your API key to the .env file in the project root.`
+          `Please add your API key to the .env file in the project root.`,
       );
     }
   }
@@ -119,7 +126,7 @@ export class LLMClient {
 
       // Build user message content with screenshot first, then text
       const userContent: any[] = [];
-      
+
       // Add screenshot as the first part if available
       if (screenshot) {
         userContent.push({
@@ -127,19 +134,19 @@ export class LLMClient {
           image: screenshot,
         });
       }
-      
+
       // Add text content
       userContent.push({
         type: "text",
         text: request.message,
       });
 
-      // Create user message in CoreMessage format
-      const userMessage: CoreMessage = {
+      // Create user message in ModelMessage format
+      const userMessage: ModelMessage = {
         role: "user",
         content: userContent.length === 1 ? request.message : userContent,
       };
-      
+
       this.messages.push(userMessage);
 
       // Send updated messages to renderer
@@ -148,7 +155,7 @@ export class LLMClient {
       if (!this.model) {
         this.sendErrorMessage(
           request.messageId,
-          "LLM service is not configured. Please add your API key to the .env file."
+          "LLM service is not configured. Please add your API key to the .env file.",
         );
         return;
       }
@@ -166,7 +173,7 @@ export class LLMClient {
     this.sendMessagesToRenderer();
   }
 
-  getMessages(): CoreMessage[] {
+  getMessages(): ModelMessage[] {
     return this.messages;
   }
 
@@ -174,11 +181,13 @@ export class LLMClient {
     this.webContents.send("chat-messages-updated", this.messages);
   }
 
-  private async prepareMessagesWithContext(_request: ChatRequest): Promise<CoreMessage[]> {
+  private async prepareMessagesWithContext(
+    _request: ChatRequest,
+  ): Promise<ModelMessage[]> {
     // Get page context from active tab
     let pageUrl: string | null = null;
     let pageText: string | null = null;
-    
+
     if (this.window) {
       const activeTab = this.window.activeTab;
       if (activeTab) {
@@ -192,7 +201,7 @@ export class LLMClient {
     }
 
     // Build system message
-    const systemMessage: CoreMessage = {
+    const systemMessage: ModelMessage = {
       role: "system",
       content: this.buildSystemPrompt(pageUrl, pageText),
     };
@@ -201,7 +210,10 @@ export class LLMClient {
     return [systemMessage, ...this.messages];
   }
 
-  private buildSystemPrompt(url: string | null, pageText: string | null): string {
+  private buildSystemPrompt(
+    url: string | null,
+    pageText: string | null,
+  ): string {
     const parts: string[] = [
       "You are a helpful AI assistant integrated into a web browser.",
       "You can analyze and discuss web pages with the user.",
@@ -219,7 +231,7 @@ export class LLMClient {
 
     parts.push(
       "\nPlease provide helpful, accurate, and contextual responses about the current webpage.",
-      "If the user asks about specific content, refer to the page content and/or screenshot provided."
+      "If the user asks about specific content, refer to the page content and/or screenshot provided.",
     );
 
     return parts.join("\n");
@@ -231,68 +243,56 @@ export class LLMClient {
   }
 
   private async streamResponse(
-    messages: CoreMessage[],
-    messageId: string
+    messages: ModelMessage[],
+    messageId: string,
   ): Promise<void> {
     if (!this.model) {
       throw new Error("Model not initialized");
     }
 
-    try {
-      const result = await streamText({
-        model: this.model,
-        messages,
-        temperature: DEFAULT_TEMPERATURE,
-        maxRetries: 3,
-        abortSignal: undefined, // Could add abort controller for cancellation
-      });
+    const result = await streamText({
+      model: this.model,
+      messages,
+      temperature: DEFAULT_TEMPERATURE,
+      maxRetries: 3,
+      stopWhen: stepCountIs(10),
+    });
 
-      await this.processStream(result.textStream, messageId);
-    } catch (error) {
-      throw error; // Re-throw to be handled by the caller
-    }
+    await this.processStream(result.fullStream, messageId);
   }
 
   private async processStream(
-    textStream: AsyncIterable<string>,
-    messageId: string
+    fullStream: AsyncIterable<TextStreamPart<ToolSet>>,
+    messageId: string,
   ): Promise<void> {
     let accumulatedText = "";
 
-    // Create a placeholder assistant message
-    const assistantMessage: CoreMessage = {
-      role: "assistant",
-      content: "",
-    };
-    
-    // Keep track of the index for updates
     const messageIndex = this.messages.length;
-    this.messages.push(assistantMessage);
+    this.messages.push({ role: "assistant", content: "" });
 
-    for await (const chunk of textStream) {
-      accumulatedText += chunk;
+    for await (const part of fullStream) {
+      if (part.type === "text-delta") {
+        accumulatedText += part.text;
 
-      // Update assistant message content
-      this.messages[messageIndex] = {
-        role: "assistant",
-        content: accumulatedText,
-      };
-      this.sendMessagesToRenderer();
+        this.messages[messageIndex] = {
+          role: "assistant",
+          content: accumulatedText,
+        };
+        this.sendMessagesToRenderer();
 
-      this.sendStreamChunk(messageId, {
-        content: chunk,
-        isComplete: false,
-      });
+        this.sendStreamChunk(messageId, {
+          content: part.text,
+          isComplete: false,
+        });
+      }
     }
 
-    // Final update with complete content
     this.messages[messageIndex] = {
       role: "assistant",
       content: accumulatedText,
     };
     this.sendMessagesToRenderer();
 
-    // Send the final complete signal
     this.sendStreamChunk(messageId, {
       content: accumulatedText,
       isComplete: true,
