@@ -12,6 +12,7 @@ import { anthropic } from "@ai-sdk/anthropic";
 import * as dotenv from "dotenv";
 import { join } from "path";
 import type { Window } from "./Window";
+import { getHederaTools } from "./hedera/hederaToolkit";
 
 // Load environment variables from .env file
 dotenv.config({ path: join(__dirname, "../../.env") });
@@ -42,6 +43,7 @@ export class LLMClient {
   private readonly provider: LLMProvider;
   private readonly modelName: string;
   private readonly model: LanguageModel | null;
+  private readonly tools: ToolSet | undefined;
   private messages: ModelMessage[] = [];
 
   constructor(webContents: WebContents) {
@@ -49,6 +51,7 @@ export class LLMClient {
     this.provider = this.getProvider();
     this.modelName = this.getModelName();
     this.model = this.initializeModel();
+    this.tools = this.initializeHederaTools();
 
     this.logInitializationStatus();
   }
@@ -90,6 +93,21 @@ export class LLMClient {
         return process.env.OPENAI_API_KEY;
       default:
         return undefined;
+    }
+  }
+
+  private initializeHederaTools(): ToolSet | undefined {
+    try {
+      const tools = getHederaTools();
+      console.log(
+        `✅ Hedera tools initialized: ${Object.keys(tools).join(", ")}`,
+      );
+      return tools;
+    } catch (error) {
+      console.warn(
+        `⚠️  Hedera tools not available: ${error instanceof Error ? error.message : error}`,
+      );
+      return undefined;
     }
   }
 
@@ -234,6 +252,12 @@ export class LLMClient {
       "If the user asks about specific content, refer to the page content and/or screenshot provided.",
     );
 
+    if (this.tools) {
+      parts.push(
+        "\nYou have tools to check the operator's HBAR balance and to transfer HBAR on Hedera testnet. Use them when the user asks about their balance or requests a transfer.",
+      );
+    }
+
     return parts.join("\n");
   }
 
@@ -256,6 +280,7 @@ export class LLMClient {
       temperature: DEFAULT_TEMPERATURE,
       maxRetries: 3,
       stopWhen: stepCountIs(10),
+      ...(this.tools ? { tools: this.tools } : {}),
     });
 
     await this.processStream(result.fullStream, messageId);
@@ -284,6 +309,16 @@ export class LLMClient {
           content: part.text,
           isComplete: false,
         });
+
+        // debugging
+      } else if (part.type === "tool-call") {
+        console.log(`[Hedera] tool-call: ${part.toolName}`, part.input);
+      } else if (part.type === "tool-result") {
+        console.log(`[Hedera] tool-result: ${part.toolName}`, part.output);
+      } else if (part.type === "tool-input-start") {
+        console.log(`[Hedera] tool-input-start: ${part.toolName}`);
+      } else if (part.type === "error") {
+        console.error("[Hedera] stream error:", part.error);
       }
     }
 
